@@ -20,6 +20,9 @@ cross-slot MGET/EXISTS/TOUCH, write-like reads and scripts, WATCH and MULTI/EXEC
 binary data, concurrent ordered RESP2/RESP3 pipelines, replica loss with primary
 fallback, planned and automatic promotion, rejoin, and global broadcasts after
 role changes. Replica mode runs with backend multiplexing enabled and disabled.
+Eight background clients keep GETRANGE, SET and cross-slot MGET requests in
+flight throughout role changes. Transient backend/topology errors are counted;
+malformed or reordered replies, hangs, and failure to recover fail the test.
 Value assertions wait for replication offsets instead of assuming synchronous
 replication. Backend command-counter deltas prove where reads execute. Writes
 must succeed and increment primary counters; replica counters also include

@@ -12,6 +12,7 @@ import pathlib
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 
@@ -442,7 +443,7 @@ def eventual_batch_suite(cluster, port):
             c.close()
 
 
-def topology_suite(cluster, c):
+def topology_changes(cluster, c, stop_load):
     key = "{failover}:value"
     c.call("SET", key, "stable")
     cluster.sync()
@@ -454,10 +455,12 @@ def topology_suite(cluster, c):
     r["up"] = False
     r["c"].close()
     eventually(lambda: info(c, "proxy").get(b"proxy_replicas") == b"2")
+    eventually(lambda: c.call("GET", key) == b"stable")
     cluster.routed(c, ("GET", key), b"master", b"stable")
     cluster.restart(r)
     cluster.sync()
     eventually(lambda: info(c, "proxy").get(b"proxy_replicas") == b"3")
+    eventually(lambda: c.call("GET", key) == b"stable")
     cluster.routed(c, ("GET", key), b"slave", b"stable")
     # Planned promotion changes pool roles while keeping stable topology indices.
     r["c"].call("CLUSTER", "FAILOVER")
@@ -483,6 +486,7 @@ def topology_suite(cluster, c):
     cluster.sync()
     eventually(lambda: info(c, "proxy").get(b"proxy_replicas") == b"3")
     cluster.routed(c, ("GET", key), b"slave", b"recovered")
+    stop_load()
     # Global broadcasts must target three primaries, never both roles per shard.
     expected_size = sum(n["c"].call("DBSIZE") for n in cluster.nodes if n["role"] == b"master")
     assert c.call("DBSIZE") == expected_size
@@ -491,6 +495,67 @@ def topology_suite(cluster, c):
     assert c.call("FLUSHALL") == b"OK"
     cluster.sync()
     assert c.call("DBSIZE") == 0
+
+
+def topology_suite(cluster, c, port):
+    stop = threading.Event()
+    # Initialize before background readers start. Replica reads can be stale,
+    # but after synchronization this key must exist until a replica restarts.
+    c.call("SET", "{failover}:value", "stable")
+    cluster.sync()
+
+    def load(i):
+        conn = Connection(port)
+        success, errors = 0, 0
+        try:
+            if i % 2:
+                conn.call("HELLO", 3)
+            while not stop.is_set():
+                replies = conn.pipeline([
+                    # Keep GET's backend counters exclusive to the routing
+                    # assertions: other workers can briefly have older roles.
+                    ("GETRANGE", "{failover}:value", 0, -1),
+                    ("SET", f"{{failover}}:load-{i}", "load"),
+                    ("MGET", "{failover}:value", "{other-shard}:absent"),
+                ])
+                for j, reply in enumerate(replies):
+                    if isinstance(reply, ResponseError):
+                        # In-flight operations are not retried during failover.
+                        assert str(reply).startswith(("ERR backend", "ERR fan-out backend error", "ERR slot not mapped", "MOVED ",
+                                                      "ASK ", "CLUSTERDOWN ", "READONLY ",
+                                                      "LOADING ", "MASTERDOWN ")), str(reply)
+                        errors += 1
+                        continue
+                    if j == 0:
+                        assert reply in (b"", b"stable", b"promoted", b"recovered"), reply
+                    elif j == 1:
+                        assert reply == b"OK", reply
+                    else:
+                        assert (isinstance(reply, list) and len(reply) == 2 and reply[1] is None
+                                and reply[0] in (None, b"stable", b"promoted", b"recovered")), reply
+                    success += 1
+                time.sleep(.002)
+        finally:
+            conn.close()
+        return success, errors
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = [executor.submit(load, i) for i in range(8)]
+
+        def stop_load():
+            stop.set()
+            counts = [f.result(timeout=10) for f in futures]
+            assert all(passed > 0 for passed, _ in counts), counts
+            print(json.dumps({"failover_inflight_successes": sum(p for p, _ in counts),
+                              "failover_inflight_errors": sum(e for _, e in counts)}), flush=True)
+
+        try:
+            topology_changes(cluster, c, stop_load)
+        finally:
+            stop.set()
+            # Surface reader exceptions even when a topology assertion fails.
+            for future in futures:
+                future.result(timeout=10)
 
 
 def main():
@@ -513,7 +578,7 @@ def main():
             cluster.record(f"transactions and WATCH multiplex={multiplex}", lambda: transaction_suite(cluster, c))
             cluster.record(f"binary RESP2/RESP3 ordered pipelines multiplex={multiplex}", lambda: pipeline_suite(cluster, port))
             cluster.record(f"mixed write/read batches eventually converge multiplex={multiplex}", lambda: eventual_batch_suite(cluster, port))
-            cluster.record(f"replica loss, promotion, rejoin multiplex={multiplex}", lambda: topology_suite(cluster, c))
+            cluster.record(f"replica loss, promotion, rejoin under load multiplex={multiplex}", lambda: topology_suite(cluster, c, port))
             c.close()
     finally:
         try:
