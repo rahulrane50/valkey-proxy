@@ -406,6 +406,7 @@ struct FanoutCtx {
 /* ── cluster / config ───────────────────────────────────────────────── */
 typedef struct {
     char node_id[64], ip[64];
+    char primary_id[64]; /* CLUSTER NODES parent ID for a replica */
     int port;
     char flags[128];
     int is_master;
@@ -421,6 +422,7 @@ typedef struct {
     ClusterNode nodes[MAX_NODES];
     int node_gen[MAX_NODES];
     int node_has_slots[MAX_NODES];
+    int node_live[MAX_NODES]; /* slot owner, or an eligible replica of one */
     int node_count;
     int slot_map[CLUSTER_SLOTS];
     int version;
@@ -519,6 +521,7 @@ typedef struct {
      * one out per command, and a client may have up to
      * max-pipeline-inflight of them in flight at once. */
     int backend_multiplexing;
+    int replica_reads; /* startup-only: prefer replicas for safe keyed reads */
     int shared_connection_per_node;
     int max_pipeline_inflight;
     /* Most bytes of queued commands a transaction keeps for replaying it on
@@ -564,6 +567,7 @@ extern int g_node_gen[MAX_NODES];
  * (scenario 3, gen also bumped but the index *does* still own slots, just
  * under a new address) so they know whether reconnecting is worthwhile. */
 extern int g_node_has_slots[MAX_NODES];
+extern int g_node_live[MAX_NODES];
 extern atomic_int g_topology_version;
 /* Sticky, process-wide: 0 until the first client's "HELLO 3" successfully
  * probes backend RESP3 support (see resp3_start_probe() in hello.c), then
@@ -720,7 +724,7 @@ void mux_req_complete(Worker *w, Req *req, const char *buf, int len);
 void mux_queue_error(ClientConn *client, const char *line, int len);
 void mux_input_done(Worker *w, ClientConn *client);
 int mux_send_cmd(Worker *w, ClientConn *client, int node_idx, int slot, const char *buf, int len);
-int mux_send_sub(Worker *w, FanoutSub *sub, int db, const char *buf, int len);
+int mux_send_sub(Worker *w, FanoutSub *sub, int db, int node_idx, const char *buf, int len);
 void mux_client_flush(Worker *w, ClientConn *client);
 void mux_client_release(ClientConn *client);
 void mux_conn_writable(Worker *w, PoolConn *conn);
@@ -733,6 +737,9 @@ int cmd_is_supported(const char *cmd);
 void str_toupper(char *s);
 PoolType route_command(ClientConn *client, const char *cmd);
 CmdClass classify_command(const char *cmd, PoolType pt);
+int cmd_is_replica_read(const char *cmd);
+int resp_is_replica_read(const char *buf, int len);
+int topo_read_node(Worker *w, int primary, int slot);
 int cmd_is_fanout(const char *cmd);
 void record_last_cmd(ClientConn *client, const char *cmd, const char *key, int keylen);
 /* Which recursion depth (if any) of cmd's reply is semantically a nil

@@ -203,18 +203,15 @@ static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, i
             p = eol ? eol + 1 : p + strlen(p);
             continue;
         }
-        /* Only masters take live traffic; replicas are never routed to
-         * (the slot map only ever points at a master index), so skip them
-         * here rather than pooling/connecting to them for nothing. A
-         * master with confirmed FAIL has no reachable data either, so
-         * skip it too -- its slots are left unmapped (-1) and any command
-         * that hashes there gets the existing "slot not mapped" error
-         * instead of a connection to a dead node. PFAIL ("fail?", not yet
-         * confirmed by cluster consensus) is kept -- the node may still be
-         * reachable. */
+        /* Slot ownership always belongs to primaries. With replica reads
+         * enabled, also retain connected replicas without FAIL/PFAIL; a
+         * missing replica falls back to its primary. Preserve the existing
+         * primary PFAIL behavior until cluster consensus confirms FAIL. */
         int is_master = (strstr(flags, "master") != NULL);
         int is_failed = has_flag(flags, "fail");
-        if (!is_master || is_failed) {
+        int is_replica = has_flag(flags, "slave") || has_flag(flags, "replica");
+        if (is_failed || (!is_master && (!g_config.replica_reads || !is_replica || has_flag(flags, "fail?") ||
+                                         strcmp(st, "connected") != 0))) {
             if (verbose) printf("  skipping node %s %s (flags=%s)\n", id, addr, flags);
             if (eol) *eol = saved;
             p = eol ? eol + 1 : p + strlen(p);
@@ -243,7 +240,13 @@ static void parse_cluster_nodes_into(const char *data, ClusterNode *out_nodes, i
         snprintf(nd->ip, sizeof(nd->ip), "%.63s", addr);
         nd->port = nport;
         snprintf(nd->flags, sizeof(nd->flags), "%.127s", flags);
-        nd->is_master = 1;
+        nd->is_master = is_master;
+        snprintf(nd->primary_id, sizeof(nd->primary_id), "%s", is_master ? "" : master);
+        if (!is_master) {
+            if (eol) *eol = saved;
+            p = eol ? eol + 1 : p + strlen(p);
+            continue;
+        }
 
         /* parse slot ranges */
         const char *tp = p + nc;
@@ -313,6 +316,35 @@ static int fetch_cluster_nodes_from(const char *ip, int port, ClusterNode *out_n
     return 0;
 }
 
+/* Slot ownership remains primary-only. Pool liveness additionally includes
+ * currently discovered replicas whose parent owns slots. */
+static void mark_live_nodes(const ClusterNode *nodes, int count, const int *has_slots, const int *present, int *live) {
+    memcpy(live, has_slots, sizeof(int) * MAX_NODES);
+    if (!g_config.replica_reads) return;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].is_master || (present && !present[i])) continue;
+        for (int j = 0; j < count; j++)
+            if (nodes[j].is_master && has_slots[j] && !strcmp(nodes[i].primary_id, nodes[j].node_id)) {
+                live[i] = 1;
+                break;
+            }
+    }
+}
+
+int topo_read_node(Worker *w, int primary, int slot) {
+    if (!g_config.replica_reads || primary < 0 || primary >= w->topo.node_count || !w->topo.nodes[primary].is_master ||
+        slot < 0)
+        return primary;
+    int replicas[MAX_NODES], n = 0;
+    for (int i = 0; i < w->topo.node_count; i++)
+        if (!w->topo.nodes[i].is_master && w->topo.node_live[i] &&
+            !strcmp(w->topo.nodes[i].primary_id, w->topo.nodes[primary].node_id))
+            replicas[n++] = i;
+    /* No eligible replica: retain the primary route. Distribution is stable
+     * per slot/worker and needs no shared mutable round-robin state. */
+    return n ? replicas[((unsigned)slot + (unsigned)w->thread_id) % (unsigned)n] : primary;
+}
+
 void fetch_cluster_nodes(void) {
     printf("Connecting to %s:%d to fetch cluster topology...\n", g_config.server_ip, g_config.server_port);
     int fd = tcp_connect(g_config.server_ip, g_config.server_port);
@@ -356,6 +388,7 @@ void fetch_cluster_nodes(void) {
         printf("  [%d] %s:%d  flags=%-24s %s\n", i, g_nodes[i].ip, g_nodes[i].port, g_nodes[i].flags,
                g_nodes[i].is_master ? "(master)" : "(replica)");
     printf("\n");
+    mark_live_nodes(g_nodes, g_node_count, g_node_has_slots, NULL, g_node_live);
     probe_backend_versions(g_nodes, g_node_count, g_node_has_slots);
 }
 
@@ -419,13 +452,14 @@ static void reconcile_and_publish(ClusterNode *dn, int dcount, int *dslot, const
 
     ClusterNode nodes[MAX_NODES];
     int gen[MAX_NODES], orig_gen[MAX_NODES];
-    int old_slot[CLUSTER_SLOTS];
+    int old_slot[CLUSTER_SLOTS], old_live[MAX_NODES];
     int old_count;
 
     pthread_rwlock_rdlock(&g_topology_lock);
     memcpy(nodes, g_nodes, sizeof(nodes));
     memcpy(gen, g_node_gen, sizeof(gen));
     memcpy(old_slot, g_slot_map, sizeof(old_slot));
+    memcpy(old_live, g_node_live, sizeof(old_live));
     old_count = g_node_count;
     pthread_rwlock_unlock(&g_topology_lock);
     memcpy(orig_gen, gen, sizeof(gen));
@@ -471,9 +505,9 @@ static void reconcile_and_publish(ClusterNode *dn, int dcount, int *dslot, const
         if (idx >= 0) {
             matched_old[idx] = 1;
             int addr_changed = strcmp(nodes[idx].node_id, dn[j].node_id) != 0 || strcmp(nodes[idx].ip, dn[j].ip) != 0 ||
-                               nodes[idx].port != dn[j].port;
+                               nodes[idx].port != dn[j].port || nodes[idx].is_master != dn[j].is_master ||
+                               strcmp(nodes[idx].primary_id, dn[j].primary_id) != 0;
             nodes[idx] = dn[j];
-            nodes[idx].is_master = 1;
             if (addr_changed) {
                 gen[idx]++;
                 is_new[idx] = 1;
@@ -484,7 +518,6 @@ static void reconcile_and_publish(ClusterNode *dn, int dcount, int *dslot, const
         } else if (count < MAX_NODES) {
             int ni = count++;
             nodes[ni] = dn[j];
-            nodes[ni].is_master = 1;
             gen[ni] = 0;
             fail_since[ni] = 0;
             grace_released[ni] = 0;
@@ -528,6 +561,35 @@ static void reconcile_and_publish(ClusterNode *dn, int dcount, int *dslot, const
         }
     }
 
+    if (g_config.replica_reads) {
+        /* A promoted replica already has its own stable index. Retire the
+         * absent former-primary role once none of its slots remain unmapped;
+         * otherwise broadcasts would keep targeting that dead primary forever.
+         * Keep missing owners while their slots are unassigned, so global
+         * operations cannot silently report a partial cluster result. */
+        for (int i = 0; i < old_count; i++) {
+            if (matched_old[i] || !nodes[i].is_master) continue;
+            int missing_slots = 0;
+            for (int k = 0; k < CLUSTER_SLOTS; k++)
+                if (owner_idx[k] == i && slot[k] < 0) {
+                    missing_slots = 1;
+                    break;
+                }
+            if (!missing_slots) {
+                nodes[i].is_master = 0;
+                nodes[i].primary_id[0] = '\0';
+                gen[i]++;
+            }
+        }
+    }
+    int live[MAX_NODES];
+    mark_live_nodes(nodes, count, has_slots, matched_old, live);
+    /* A replica leaving/rejoining discovery must not reuse old sockets
+     * whose READONLY state or connection identity may no longer be valid. */
+    if (g_config.replica_reads)
+        for (int i = 0; i < old_count; i++)
+            if (!nodes[i].is_master && live[i] != old_live[i] && gen[i] == orig_gen[i]) gen[i]++;
+
     int changed = (count != old_count);
     if (!changed)
         for (int i = 0; i < old_count; i++)
@@ -536,19 +598,22 @@ static void reconcile_and_publish(ClusterNode *dn, int dcount, int *dslot, const
                 break;
             }
     if (!changed) changed = (memcmp(old_slot, slot, sizeof(slot)) != 0);
+    if (!changed) changed = (memcmp(old_live, live, sizeof(live)) != 0);
 
     if (!changed) return;
 
-    /* Only printed when the master set/topology actually changed this
+    /* Only printed when the node set/topology actually changed this
      * round, with whatever's new/updated called out. */
-    printf("[topology] current master(s) (%d), source=%s:%d:\n", count, src_ip, src_port);
+    printf("[topology] current node(s) (%d), source=%s:%d:\n", count, src_ip, src_port);
     for (int i = 0; i < count; i++)
-        printf("  [%d] %s:%d%s\n", i, nodes[i].ip, nodes[i].port, is_new[i] ? "   <-- NEW/UPDATED MASTER" : "");
+        printf("  [%d] %s:%d (%s)%s\n", i, nodes[i].ip, nodes[i].port, nodes[i].is_master ? "primary" : "replica",
+               is_new[i] ? "   <-- NEW/UPDATED" : "");
 
     pthread_rwlock_wrlock(&g_topology_lock);
     memcpy(g_nodes, nodes, sizeof(g_nodes));
     memcpy(g_node_gen, gen, sizeof(g_node_gen));
     memcpy(g_node_has_slots, has_slots, sizeof(g_node_has_slots));
+    memcpy(g_node_live, live, sizeof(g_node_live));
     memcpy(g_slot_map, slot, sizeof(g_slot_map));
     g_node_count = count;
     pthread_rwlock_unlock(&g_topology_lock);

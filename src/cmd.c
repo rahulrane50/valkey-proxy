@@ -1,5 +1,97 @@
 #include "proxy.h"
 
+/* Conservative allowlist: mixed read/write commands (GETEX, SORT, BITFIELD,
+ * GEORADIUS, arbitrary scripts, etc.) stay on primaries. Transaction/WATCH
+ * and authenticated-client dispatchers also retain their primary routing. */
+int cmd_is_replica_read(const char *cmd) {
+    static const char *const reads[] = {"GET",
+                                        "MGET",
+                                        "GETBIT",
+                                        "GETRANGE",
+                                        "STRLEN",
+                                        "DUMP",
+                                        "TYPE",
+                                        "EXISTS",
+                                        "TOUCH",
+                                        "TTL",
+                                        "PTTL",
+                                        "EXPIRETIME",
+                                        "PEXPIRETIME",
+                                        "BITCOUNT",
+                                        "BITPOS",
+                                        "BITFIELD_RO",
+                                        "HEXISTS",
+                                        "HGET",
+                                        "HMGET",
+                                        "HGETALL",
+                                        "HKEYS",
+                                        "HLEN",
+                                        "HSTRLEN",
+                                        "HVALS",
+                                        "HRANDFIELD",
+                                        "HSCAN",
+                                        "HTTL",
+                                        "HPTTL",
+                                        "HEXPIRETIME",
+                                        "HPEXPIRETIME",
+                                        "LINDEX",
+                                        "LLEN",
+                                        "LPOS",
+                                        "LRANGE",
+                                        "LCS",
+                                        "SCARD",
+                                        "SISMEMBER",
+                                        "SMISMEMBER",
+                                        "SMEMBERS",
+                                        "SRANDMEMBER",
+                                        "SSCAN",
+                                        "SDIFF",
+                                        "SINTER",
+                                        "SINTERCARD",
+                                        "SUNION",
+                                        "ZCARD",
+                                        "ZCOUNT",
+                                        "ZLEXCOUNT",
+                                        "ZMSCORE",
+                                        "ZRANGE",
+                                        "ZRANGEBYLEX",
+                                        "ZRANGEBYSCORE",
+                                        "ZRANK",
+                                        "ZREVRANGE",
+                                        "ZREVRANGEBYLEX",
+                                        "ZREVRANGEBYSCORE",
+                                        "ZREVRANK",
+                                        "ZSCORE",
+                                        "ZRANDMEMBER",
+                                        "ZSCAN",
+                                        "ZDIFF",
+                                        "ZINTER",
+                                        "ZINTERCARD",
+                                        "ZUNION",
+                                        "PFCOUNT",
+                                        "GEODIST",
+                                        "GEOHASH",
+                                        "GEOPOS",
+                                        "GEOSEARCH",
+                                        "GEORADIUS_RO",
+                                        "GEORADIUSBYMEMBER_RO",
+                                        "SORT_RO",
+                                        "OBJECT"};
+    for (size_t i = 0; i < sizeof(reads) / sizeof(reads[0]); i++)
+        if (!strcmp(cmd, reads[i])) return 1;
+    return 0;
+}
+
+int resp_is_replica_read(const char *buf, int len) {
+    const char *arg;
+    int n;
+    char cmd[32];
+    if (!resp_get_nth_arg(buf, len, 0, &arg, &n) || n <= 0 || n >= (int)sizeof(cmd)) return 0;
+    for (int i = 0; i < n; i++) cmd[i] = (char)toupper((unsigned char)arg[i]);
+    cmd[n] = '\0';
+    return cmd_is_replica_read(cmd);
+}
+
 const char *POOL_NAME[POOL_TYPE_COUNT] = {"normal", "blocking", "subscription", "transaction", "acl", "shared"};
 
 const char *CMD_CLASS_NAME[] = {"SINGLE_KEY", "MULTI_KEY", "NO_SLOT", "BLOCKING", "PUBSUB", "ACL"};

@@ -294,6 +294,13 @@ static int append_clients(GrowBuf *g) {
 
 static int append_proxy(Worker *w, GrowBuf *g, int queried, int ok) {
     int unmapped = 0;
+    int shards = 0, replicas = 0;
+    for (int i = 0; i < w->topo.node_count; i++) {
+        if (w->topo.node_has_slots[i])
+            shards++;
+        else if (!w->topo.nodes[i].is_master && w->topo.node_live[i])
+            replicas++;
+    }
     for (int s = 0; s < CLUSTER_SLOTS; s++)
         if (w->topo.slot_map[s] < 0) unmapped++;
     int rc = gb_append_fmt(g,
@@ -301,12 +308,15 @@ static int append_proxy(Worker *w, GrowBuf *g, int queried, int ok) {
                            "proxy_workers:%d\r\n"
                            "proxy_topology_version:%d\r\n"
                            "proxy_shards:%d\r\n"
+                           "proxy_replicas:%d\r\n"
+                           "proxy_read_policy:%s\r\n"
                            "proxy_unmapped_slots:%d\r\n"
                            "proxy_cluster_refresh_interval_ms:%d\r\n"
                            "info_shards_queried:%d\r\n"
                            "info_shards_ok:%d\r\n"
                            "info_shards_failed:%d\r\n",
-                           g_config.worker_thread_no, w->topo.version, w->topo.node_count, unmapped,
+                           g_config.worker_thread_no, w->topo.version, shards, replicas,
+                           g_config.replica_reads ? "replica-preferred" : "primary", unmapped,
                            g_config.cluster_refresh_interval_ms, queried, ok, queried - ok);
     /* Per-worker client counts, to see how evenly accept() spread them. */
     for (int i = 0; i < g_config.worker_thread_no && rc == 0; i++)

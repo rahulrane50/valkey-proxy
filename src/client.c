@@ -1218,6 +1218,8 @@ static void client_process_input(Worker *w, ClientConn *client) {
             client_reject_error(w, client, "slot not mapped");
             return;
         }
+        if (g_config.replica_reads && !client->txn_conn && cmd_is_replica_read(cmd))
+            node_idx = topo_read_node(w, node_idx, slot);
         client->node_idx = node_idx;
 
         if (client->mux_cmd) {

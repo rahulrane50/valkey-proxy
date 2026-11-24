@@ -16,6 +16,7 @@ int g_node_count = 0;
 int g_slot_map[CLUSTER_SLOTS];
 int g_node_gen[MAX_NODES];
 int g_node_has_slots[MAX_NODES];
+int g_node_live[MAX_NODES];
 atomic_int g_topology_version = 0;
 atomic_int g_backend_resp3_active = 0;
 atomic_llong g_next_client_id = 0;

@@ -1400,9 +1400,16 @@ void fanout_aggregate_and_reply(Worker *w, FanoutCtx *ctx) {
 
 static void fanout_dispatch_sub(Worker *w, FanoutCtx *ctx, int sub_idx, const char *cmdbuf, int cmdlen) {
     FanoutSub *sub = &ctx->subs[sub_idx];
+    int node_idx = sub->node_idx;
+    /* Composite operations may create temporary coordinator keys. Keep their
+     * stages together on primaries; only these direct read fan-outs offload. */
+    if (g_config.replica_reads && !ctx->client->acl_authenticated && !ctx->client->txn_conn &&
+        (!strcmp(ctx->cmd, "MGET") || !strcmp(ctx->cmd, "EXISTS") || !strcmp(ctx->cmd, "TOUCH")) &&
+        resp_is_replica_read(cmdbuf, cmdlen))
+        node_idx = topo_read_node(w, node_idx, sub->slot);
     if (ctx->req) {
         /* Multiplexed: the reply comes back through fanout_sub_complete(). */
-        if (mux_send_sub(w, sub, ctx->client->db, cmdbuf, cmdlen) < 0) {
+        if (mux_send_sub(w, sub, ctx->client->db, node_idx, cmdbuf, cmdlen) < 0) {
             sub->error = 1;
             sub->done = 1;
             ctx->had_error = 1;
@@ -1418,7 +1425,7 @@ static void fanout_dispatch_sub(Worker *w, FanoutCtx *ctx, int sub_idx, const ch
         ctx->ndone++;
         return;
     }
-    ConnPool *pool = &grp->node_pools[sub->node_idx].pools[POOL_NORMAL];
+    ConnPool *pool = &grp->node_pools[node_idx].pools[POOL_NORMAL];
     PoolConn *conn = pool_acquire_nb(w, pool);
     if (!conn) {
         sub->error = 1;
@@ -1474,6 +1481,9 @@ static void fanout_dispatch_sub(Worker *w, FanoutCtx *ctx, int sub_idx, const ch
 }
 
 static void fanout_route_single(Worker *w, ClientConn *client, int node_idx, int slot) {
+    if (g_config.replica_reads && !client->acl_authenticated && !client->txn_conn &&
+        resp_is_replica_read(client->pbuf, client->pbuf_len))
+        node_idx = topo_read_node(w, node_idx, slot);
     if (client->mux_cmd) {
         if (mux_send_cmd(w, client, node_idx, slot, client->pbuf, client->pbuf_len) == 0) mux_input_done(w, client);
         return;
@@ -4187,6 +4197,14 @@ void handle_multikey_complete(Worker *w, ClientConn *client, const char *cmd) {
     if (client->acl_authenticated) {
         acl_route_business_cmd(w, client, node_idx);
         return;
+    }
+
+    /* The keys above were validated to share one slot. This path also
+     * handles read-only set/zset operations and PFCOUNT, which do not use
+     * the scatter/gather dispatcher. Scripts remain outside the allowlist. */
+    if (g_config.replica_reads && !client->txn_conn && nkeys > 0 && cmd_is_replica_read(cmd)) {
+        node_idx = topo_read_node(w, node_idx, key_slot(kp[0], kl[0]));
+        client->node_idx = node_idx;
     }
 
     DbGroup *grp = db_group_get(w, client->db);

@@ -67,6 +67,7 @@ void parse_conf(const char *path) {
     g_config.cluster_node_fail_grace_ms = 10000;
     g_config.backend_connect_timeout_ms = DEFAULT_BACKEND_CONNECT_TIMEOUT_MS;
     g_config.backend_multiplexing = 1;
+    g_config.replica_reads = 0;
     g_config.shared_connection_per_node = DEFAULT_SHARED_CONNECTION_PER_NODE;
     g_config.max_pipeline_inflight = DEFAULT_MAX_PIPELINE_INFLIGHT;
     g_config.transaction_replay_buffer_size = 1024 * 1024;
@@ -122,7 +123,16 @@ void parse_conf(const char *path) {
             g_config.backend_connect_timeout_ms = atoi(val);
         else if (!strcmp(key, "backend-multiplexing"))
             g_config.backend_multiplexing = (!strcmp(val, "yes"));
-        else if (!strcmp(key, "shared-connection-per-node"))
+        else if (!strcmp(key, "read-policy")) {
+            if (!strcmp(val, "primary"))
+                g_config.replica_reads = 0;
+            else if (!strcmp(val, "replica-preferred"))
+                g_config.replica_reads = 1;
+            else {
+                fprintf(stderr, "%s:%d: read-policy must be primary or replica-preferred\n", path, lineno);
+                exit(1);
+            }
+        } else if (!strcmp(key, "shared-connection-per-node"))
             g_config.shared_connection_per_node = atoi(val);
         else if (!strcmp(key, "max-pipeline-inflight"))
             g_config.max_pipeline_inflight = atoi(val);

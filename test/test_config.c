@@ -59,6 +59,12 @@ static void check_validation(void) {
     const char *base = "server-ip 127.0.0.1\nserver-port 6379\nport 7777\n";
     char buf[512];
     assert(parse_status(base) == 0);
+    snprintf(buf, sizeof(buf), "%sread-policy primary\n", base);
+    assert(parse_status(buf) == 0);
+    snprintf(buf, sizeof(buf), "%sread-policy replica-preferred\n", base);
+    assert(parse_status(buf) == 0);
+    snprintf(buf, sizeof(buf), "%sread-policy unknown\n", base);
+    assert(parse_status(buf) == 1);
     /* comments, blank lines and indented comments are fine */
     snprintf(buf, sizeof(buf), "# c\n\n   # indented\n\t\n%smax-multikey-payload 1048576\n", base);
     assert(parse_status(buf) == 0);

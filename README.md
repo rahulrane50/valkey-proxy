@@ -58,6 +58,29 @@ resolution uses the system resolver's timeout.
 Run `make test-config` for standalone configuration and hostname connection tests
 (no running Valkey cluster required).
 
+### Optional replica reads
+
+Set `read-policy replica-preferred` to discover replicas and offload eligible
+keyed reads. The default, `primary`, preserves primary-only routing. A replica
+connection completes `READONLY` before accepting commands. Slot ownership and
+writes remain on primaries; topology refresh handles replica removal and role
+changes. If discovery contains no eligible replica for a shard, reads use its
+primary. Requests already in flight during a failure can fail; the proxy does
+not retry them automatically.
+
+Replication is asynchronous. Replica reads can return stale values, even after
+a write on the same client connection. Transactions and WATCH, authenticated
+ACL sessions, scripts, blocking commands, global broadcasts (including SCAN),
+and composite cross-slot operations retain primary routing. Direct MGET,
+EXISTS and TOUCH fan-outs can use replicas. The explicit command allowlist is
+in `src/cmd.c`. This setting is startup-only; `INFO proxy` reports
+`proxy_read_policy` and the number of discovered eligible `proxy_replicas`.
+Backend INFO statistics continue to aggregate primaries, so use backend
+command counters to measure replica traffic.
+
+See [the local replica integration tests](test/replica/README.md) for the
+disposable six-node Docker test matrix.
+
 Optional parameters:
 ```
 worker-thread-no  1    # number of worker threads (default: 1)

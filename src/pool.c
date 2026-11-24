@@ -49,6 +49,28 @@ static int send_select(int fd, int db) {
     return (resp[0] == '+') ? 0 : -1;
 }
 
+/* Consume the entire acknowledgement before this socket enters a pool;
+ * otherwise it could be mistaken for the first business command's reply. */
+static int send_readonly(int fd) {
+    static const char command[] = "*1\r\n$8\r\nREADONLY\r\n";
+    size_t off = 0;
+    while (off < sizeof(command) - 1) {
+        ssize_t n = write(fd, command + off, sizeof(command) - 1 - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    char reply[5];
+    off = 0;
+    while (off < sizeof(reply)) {
+        ssize_t n = read(fd, reply + off, sizeof(reply) - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return memcmp(reply, "+OK\r\n", sizeof(reply)) == 0 ? 0 : -1;
+}
+
 int pool_new_fd(Worker *w, ConnPool *p) {
     const ClusterNode *node = &w->topo.nodes[p->node_idx];
     /* Short, configurable timeout (not tcp_connect()'s fixed 5s) -- this
@@ -61,7 +83,7 @@ int pool_new_fd(Worker *w, ConnPool *p) {
         stat_add(&p->stats.connect_failures, 1);
         return -1;
     }
-    if (p->db != 0 && send_select(fd, p->db) < 0) {
+    if ((!node->is_master && send_readonly(fd) < 0) || (p->db != 0 && send_select(fd, p->db) < 0)) {
         close(fd);
         stat_add(&p->stats.connect_failures, 1);
         return -1;
@@ -473,7 +495,7 @@ static DbGroup *db_group_create(Worker *w, int db) {
     int total = 0;
     for (int ni = 0; ni < MAX_NODES; ni++) {
         NodePools *np = &node_pools[ni];
-        if (ni >= w->topo.node_count) {
+        if (ni >= w->topo.node_count || (g_config.replica_reads && !w->topo.node_live[ni])) {
             np->node_idx = -1;
             np->gen = -1;
             continue;
@@ -521,6 +543,7 @@ void worker_sync_topology(Worker *w) {
     memcpy(w->topo.nodes, g_nodes, sizeof(w->topo.nodes));
     memcpy(w->topo.node_gen, g_node_gen, sizeof(w->topo.node_gen));
     memcpy(w->topo.node_has_slots, g_node_has_slots, sizeof(w->topo.node_has_slots));
+    memcpy(w->topo.node_live, g_node_live, sizeof(w->topo.node_live));
     memcpy(w->topo.slot_map, g_slot_map, sizeof(w->topo.slot_map));
     w->topo.node_count = g_node_count;
     w->topo.version = atomic_load_explicit(&g_topology_version, memory_order_acquire);
@@ -531,6 +554,7 @@ void worker_sync_topology(Worker *w) {
         for (int idx = 0; idx < w->topo.node_count; idx++) {
             NodePools *np = &grp->node_pools[idx];
             if (np->gen == -1) {
+                if (g_config.replica_reads && !w->topo.node_live[idx]) continue;
                 np->node_idx = idx;
                 printf("  [worker %d] db%d: new shard [%d] %s:%d discovered, warming pools\n", w->thread_id, grp->db,
                        idx, w->topo.nodes[idx].ip, w->topo.nodes[idx].port);
@@ -543,7 +567,7 @@ void worker_sync_topology(Worker *w) {
                  * with nobody claiming these slots" (scenario 2 -- idx owns
                  * nothing right now, reconnecting would just hammer a dead
                  * address) hinges entirely on node_has_slots[idx]. */
-                int still_owns_slots = w->topo.node_has_slots[idx];
+                int still_owns_slots = w->topo.node_live[idx];
                 printf("  [worker %d] db%d: shard [%d] identity changed (now %s:%d), flushing pools%s\n", w->thread_id,
                        grp->db, idx, w->topo.nodes[idx].ip, w->topo.nodes[idx].port,
                        still_owns_slots ? "" : " (no longer owns any slot, not reconnecting)");
@@ -681,7 +705,7 @@ void worker_apply_pool_config(Worker *w) {
         for (int ni = 0; ni < MAX_NODES; ni++) {
             NodePools *np = &nps[ni];
             if (np->gen < 0) continue;
-            int owns = ni < w->topo.node_count && w->topo.node_has_slots[ni];
+            int owns = ni < w->topo.node_count && w->topo.node_live[ni];
             for (int pt = 0; pt < POOL_TYPE_COUNT; pt++) {
                 if (pt == POOL_SHARED) continue;
                 ConnPool *p = &np->pools[pt];

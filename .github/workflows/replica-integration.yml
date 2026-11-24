@@ -1,0 +1,27 @@
+name: Replica routing integration
+on:
+  push:
+    branches: ['poc-*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  replica-routing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: ['valkey/valkey:9.0', 'redis:7']
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+      - name: Build local proxy image
+        run: docker build -f test/replica/Dockerfile -t valkey-proxy:replica-local .
+      - name: Test six-node cluster
+        run: python3 test/replica/integration.py --backend-image '${{ matrix.backend }}' --output build/replica-results
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        if: always()
+        with:
+          name: replica-routing-${{ strategy.job-index }}
+          path: build/replica-results/

@@ -523,8 +523,8 @@ int mux_send_cmd(Worker *w, ClientConn *client, int node_idx, int slot, const ch
 
 /* Sends a fan-out sub-request over the shared connection for sub->slot.
  * -1 if it couldn't be sent (the caller fails the sub). */
-int mux_send_sub(Worker *w, FanoutSub *sub, int db, const char *buf, int len) {
-    PoolConn *c = mux_conn_for(w, db, sub->node_idx, sub->slot);
+int mux_send_sub(Worker *w, FanoutSub *sub, int db, int node_idx, const char *buf, int len) {
+    PoolConn *c = mux_conn_for(w, db, node_idx, sub->slot);
     if (!c) return -1;
     MuxEntry e = {.sub = sub};
     return mux_write(w, c, &e, buf, len);
